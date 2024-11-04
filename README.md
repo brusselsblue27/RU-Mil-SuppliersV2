@@ -21,3 +21,5 @@ This project is a Python tool that retrieves and processes data from the OpenSan
    ```bash
    git clone https://github.com/your-username/your-repo.git
    cd your-repo
+
+2. Insert API keys into .env file.
