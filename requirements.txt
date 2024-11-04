@@ -1,0 +1,6 @@
+pandas
+requests
+python-dotenv
+fuzzywuzzy
+python-Levenshtein
+
