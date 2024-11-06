@@ -26,7 +26,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configurations
 DATE_RANGE = ("2014-07-31", "2022-02-23")
-TEST_MODE = False  # Set this to True to limit to 10 companies for testing
+TEST_MODE = False  # Set this to True to limit to 20 companies for testing
 API_RETRY_TIMEOUT = 20 * 60  # 20 minutes in seconds
 
 def is_valid_inn(number):
@@ -198,89 +198,119 @@ def fetch_opensanctions_data(api_key, keywords, excluded_keywords):
     logging.info(f"Data saved to {output_path}")
     return output_path
 
-def fetch_clearspending_data(input_file, output_file, api_keys, product_codes):
-    """Fetch supplier data from ClearSpending API for each INN code with rate-limiting and timeout."""
-    base_url = "https://newapi.clearspending.ru/csinternalapi/v1/filtered-contracts/"
-    current_key_index = 0
-
-    def switch_api_key():
-        nonlocal current_key_index
-        current_key_index += 1
-        if current_key_index >= len(api_keys):
-            logging.error("All API keys have reached their quota. Please try again later.")
-            raise SystemExit
-        logging.info(f"Switching to API Key #{current_key_index + 1}")
-
-    def query_clearspending(inn, page_size=50, start_date=DATE_RANGE[0], end_date=DATE_RANGE[1], product_codes=None):
-        params = {
-            'apikey': api_keys[current_key_index],
-            'page_size': page_size,
-            'sort': '-amount_rur',
-            'sign_date_gte': start_date,
-            'sign_date_lte': end_date,
-            'customer_inn': inn,
-            'product_codes': ','.join(product_codes) if product_codes else None
-        }
+def query_clearspending(inn, api_keys, current_key_index=0, page_size=50, start_date=DATE_RANGE[0], end_date=DATE_RANGE[1]):
+    """Query the ClearSpending API for all contracts for a specific INN within the date range."""
+    params = {
+        'apikey': api_keys[current_key_index],
+        'page_size': page_size,
+        'sort': '-amount_rur',
+        'sign_date_gte': start_date,
+        'sign_date_lte': end_date,
+        'customer_inn': inn,
+        'page': 1  # Start with page 1
+    }
+    all_contracts = []
+    
+    while True:
+        logging.debug(f"Sending request to ClearSpending API with params: {params}")
         try:
-            logging.debug(f"Sending request to ClearSpending API with params: {params}")
-            response = requests.get(base_url, params=params)
+            response = requests.get("https://newapi.clearspending.ru/csinternalapi/v1/filtered-contracts/", params=params)
             if response.status_code == 429:
                 logging.warning(f"Rate limit exceeded for API Key #{current_key_index + 1}")
-                switch_api_key()
+                current_key_index += 1
+                if current_key_index >= len(api_keys):
+                    logging.error("All API keys have reached their quota. Please try again later.")
+                    raise SystemExit
                 time.sleep(5)
-                return query_clearspending(inn, page_size, start_date, end_date, product_codes)
-            if response.status_code == 200:
-                return response.json()
+                params['apikey'] = api_keys[current_key_index]
+                continue
+            elif response.status_code == 200:
+                data = response.json()
+                contracts = data.get('data', [])
+                all_contracts.extend(contracts)
+                if data.get('next_page'):
+                    params['page'] += 1  # Go to next page
+                else:
+                    break  # No more pages
             else:
                 logging.error(f"INN search failed: {response.status_code} - {response.text}")
+                break
         except requests.exceptions.RequestException as e:
             logging.error(f"Error querying the API: {e}")
-        return None
+            break
+    
+    return all_contracts
 
+def fetch_clearspending_data(input_file, output_file, api_keys, product_codes):
+    """Fetch supplier data from ClearSpending API for each INN code and filter results based on OKPD2 codes locally."""
     logging.debug(f"Reading input file: {input_file}")
     data = pd.read_csv(input_file)
-    output_data = []
+    suppliers_aggregate = {}
+
+    if TEST_MODE:
+        test_product_codes = product_codes[:2]
+    else:
+        test_product_codes = product_codes
+
     for index, row in data.iterrows():
-        if TEST_MODE and index >= 10:
+        if TEST_MODE and index >= 20:
             break
         caption = row['caption']
         inn_code = str(int(row['innCode'])) if not pd.isnull(row['innCode']) else None
         if inn_code:
-            result = query_clearspending(inn=inn_code, product_codes=product_codes)
-            if result:
-                contracts = result.get('data', [])
-                suppliers = {}
-                for contract in contracts:
+            contracts = query_clearspending(inn=inn_code, api_keys=api_keys)
+            if contracts:
+                logging.debug(f"Total contracts fetched for INN {inn_code}: {len(contracts)}")
+                logging.debug(f"Sample contract data: {contracts[0] if contracts else 'No contracts available'}")
+
+                # Filter contracts based on the list of OKPD2 codes in each contract's 'product_codes' field
+                filtered_contracts = [
+                    contract for contract in contracts
+                    if any(any(product_code.startswith(okpd2_code.strip()) for product_code in contract.get('product_codes', [])) for okpd2_code in test_product_codes)
+                ]
+                logging.debug(f"Contracts after filtering for INN {inn_code}: {len(filtered_contracts)}")
+
+                top_contracts = sorted(
+                    filtered_contracts,
+                    key=lambda c: c.get('amount_rur', 0),
+                    reverse=True
+                )[:3]
+                
+                for contract in top_contracts:
                     for supplier_inn, supplier_name, amount in zip(
                         contract.get('supplier_inns', []),
                         contract.get('supplier_names', []),
                         [contract.get('amount_rur')] * len(contract.get('supplier_inns', []))
                     ):
-                        if supplier_inn not in suppliers:
-                            suppliers[supplier_inn] = {'supplier_name': supplier_name, 'total_value': amount}
+                        if supplier_inn not in suppliers_aggregate:
+                            suppliers_aggregate[supplier_inn] = {
+                                'Supplier Name': supplier_name,
+                                'Supplier INN': supplier_inn,
+                                'Total Contract Value': amount,
+                                'OKPD2 Codes': set(contract.get('product_codes', [])),
+                                'Company Names': set([caption]),
+                                'Company INNs': set([inn_code])
+                            }
                         else:
-                            suppliers[supplier_inn]['total_value'] += amount
-
-                top_suppliers = sorted(suppliers.items(), key=lambda x: x[1]['total_value'], reverse=True)[:3]
-                supplier_data = {
-                    'Company Name': caption,
-                    'Company INN': inn_code,
-                    'Supplier 1 Name': top_suppliers[0][1]['supplier_name'] if len(top_suppliers) > 0 else None,
-                    'Supplier 1 INN': top_suppliers[0][0] if len(top_suppliers) > 0 else None,
-                    'Supplier 1 Contract Value': top_suppliers[0][1]['total_value'] if len(top_suppliers) > 0 else None,
-                    'Supplier 2 Name': top_suppliers[1][1]['supplier_name'] if len(top_suppliers) > 1 else None,
-                    'Supplier 2 INN': top_suppliers[1][0] if len(top_suppliers) > 1 else None,
-                    'Supplier 2 Contract Value': top_suppliers[1][1]['total_value'] if len(top_suppliers) > 1 else None,
-                    'Supplier 3 Name': top_suppliers[2][1]['supplier_name'] if len(top_suppliers) > 2 else None,
-                    'Supplier 3 INN': top_suppliers[2][0] if len(top_suppliers) > 2 else None,
-                    'Supplier 3 Contract Value': top_suppliers[2][1]['total_value'] if len(top_suppliers) > 2 else None
-                }
-                if any(supplier_data.values()):
-                    output_data.append(supplier_data)
+                            suppliers_aggregate[supplier_inn]['Total Contract Value'] += amount
+                            suppliers_aggregate[supplier_inn]['OKPD2 Codes'].update(contract.get('product_codes', []))
+                            suppliers_aggregate[supplier_inn]['Company Names'].add(caption)
+                            suppliers_aggregate[supplier_inn]['Company INNs'].add(inn_code)
             else:
-                logging.info(f"No results found for company: {caption}")
-            logging.debug(f"Company INN: {inn_code}")
-        time.sleep(5)
+                logging.info(f"No results found for company: {caption} with INN {inn_code}")
+            time.sleep(5)
+
+    output_data = []
+    for supplier_info in suppliers_aggregate.values():
+        supplier_data = {
+            'Supplier Name': supplier_info['Supplier Name'],
+            'Supplier INN': supplier_info['Supplier INN'],
+            'Total Contract Value': supplier_info['Total Contract Value'],
+            'OKPD2 Codes': ', '.join(supplier_info['OKPD2 Codes']),
+            'Customer Company Names': ', '.join(supplier_info['Company Names']),
+            'Customer Company INNs': ', '.join(supplier_info['Company INNs'])
+        }
+        output_data.append(supplier_data)
 
     output_df = pd.DataFrame(output_data)
     logging.debug(f"Writing output data to file: {output_file}")
@@ -292,13 +322,11 @@ def main():
     opensanctions_key, clearspending_keys = get_api_keys()
     keywords, excluded_keywords, product_codes = setup_mode()
     
-    # Phase 1: Fetch data from OpenSanctions
     logging.info("Fetching data from OpenSanctions...")
     inn_csv_path = fetch_opensanctions_data(opensanctions_key, keywords, excluded_keywords)
     if inn_csv_path:
         logging.info(f"Data saved to {inn_csv_path}")
 
-        # Phase 2: Fetch supplier data from ClearSpending
         output_path = os.path.join(OUTPUT_DIR, "clearspending_results.csv")
         logging.debug("Starting fetch_clearspending_data...")
         fetch_clearspending_data(inn_csv_path, output_path, clearspending_keys, product_codes)
