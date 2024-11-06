@@ -20,6 +20,6 @@ This project is a Python tool that retrieves and processes data from the OpenSan
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/brusselsblue27/RU-Mil-SuppliersV2
-   cd your-repo
+   cd Ru-Mil4
 
 2. Insert API keys into .env file.
